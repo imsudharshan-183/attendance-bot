@@ -1,0 +1,7 @@
+venv/
+creds.json
+attendance.db*
+*.xlsx
+__pycache__/
+*.pyc
+.env
