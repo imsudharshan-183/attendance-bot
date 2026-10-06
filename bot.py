@@ -1,6 +1,7 @@
-import os, sqlite3, asyncio
+import os, sqlite3, asyncio, threading, time, urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from openpyxl import Workbook
 from telegram import Update
 from telegram.ext import (ApplicationBuilder, CommandHandler,
@@ -11,6 +12,44 @@ FMT = "%Y-%m-%d %H:%M:%S"
 WORDS = {"present": "Present", "p": "Present", "absent": "Absent", "a": "Absent"}
 LEAVE_WORDS = {"leave", "leaving", "left", "l"}
 PRANK_IDS = set()  # optional: add Telegram user IDs, e.g. {123456789}
+
+# ---------- Health API (keeps Render free Web Service awake) ----------
+PING_INTERVAL = 240  # seconds; must stay well under Render's 15 min idle limit
+
+
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}')
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):  # silence request logs
+        pass
+
+
+def run_health_api():
+    port = int(os.environ.get("PORT", 10000))  # Render provides PORT
+    ThreadingHTTPServer(("0.0.0.0", port), Health).serve_forever()
+
+
+def self_ping():
+    base = os.environ.get("RENDER_EXTERNAL_URL")  # set automatically by Render
+    if not base:
+        print("RENDER_EXTERNAL_URL not set, self-ping disabled (running locally?)")
+        return
+    while True:
+        time.sleep(PING_INTERVAL)
+        try:
+            urllib.request.urlopen(base.rstrip("/") + "/health", timeout=10)
+            print("health ping ok")
+        except Exception as e:
+            print("health ping failed:", e)
+
 
 # ---------- Database ----------
 DB_PATH = os.environ.get("DB_PATH", "attendance.db")
@@ -39,6 +78,7 @@ else:
 
 q = asyncio.Queue()
 
+
 async def sheet_worker():
     while True:
         batch = [await q.get()]
@@ -54,9 +94,11 @@ async def sheet_worker():
                 print("Sheets error:", e)
                 await asyncio.sleep(5 * (attempt + 1))
 
+
 async def start_worker(app):
     if sheet:
         asyncio.create_task(sheet_worker())
+
 
 # ---------- Helpers ----------
 def duration(start_ts: str, end_ts: str) -> str:
@@ -64,9 +106,11 @@ def duration(start_ts: str, end_ts: str) -> str:
     h, m = divmod(max(secs, 0) // 60, 60)
     return f"{h}h {m}m"
 
+
 def msg_time(update: Update):
     # Telegram's own message time, so delays/restarts don't shift timestamps
     return update.message.date.astimezone(TZ)
+
 
 # ---------- Handlers ----------
 async def record(update: Update, status: str):
@@ -89,6 +133,7 @@ async def record(update: Update, status: str):
     if sheet:
         q.put_nowait([day, u.full_name, status, ts, str(c.id), ""])
     await update.message.reply_text(f"{u.full_name}: {status} at {now:%d-%b-%Y %H:%M:%S}")
+
 
 async def leave(update: Update, _):
     u, c, now = update.effective_user, update.effective_chat, msg_time(update)
@@ -119,11 +164,14 @@ async def leave(update: Update, _):
         f"{u.full_name}: Leaving at {now:%d-%b-%Y %H:%M:%S}\n"
         f"Note: total worked {worked} (in at {row[1]})")
 
+
 async def present(update: Update, _): await record(update, "Present")
 async def absent(update: Update, _):  await record(update, "Absent")
 
+
 async def myid(update: Update, _):
     await update.message.reply_text(str(update.effective_user.id))
+
 
 async def text(update: Update, _):
     t = (update.message.text or "").strip().lower()
@@ -131,6 +179,7 @@ async def text(update: Update, _):
         await leave(update, _)
     elif t in WORDS:
         await record(update, WORDS[t])
+
 
 async def export(update: Update, _):
     rows = db.execute(
@@ -145,6 +194,7 @@ async def export(update: Update, _):
     with open(fn, "rb") as f:
         await update.message.reply_document(f)
 
+
 # ---------- Start ----------
 app = (ApplicationBuilder().token(os.environ["BOT_TOKEN"])
        .concurrent_updates(True).post_init(start_worker).build())
@@ -155,5 +205,10 @@ app.add_handler(CommandHandler("export", export))
 app.add_handler(CommandHandler("id", myid))
 app.add_handler(MessageHandler(
     filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, text))
+
+# Start health API + self-ping in background threads
+threading.Thread(target=run_health_api, daemon=True).start()
+threading.Thread(target=self_ping, daemon=True).start()
+
 print("Bot running. Ctrl+C to stop.")
 app.run_polling()
